@@ -1,4 +1,4 @@
-name: دانلود فایل دلخواه شما با نت ملی
+name: دانلود فایل دلخواه با نت ملی
 
 on:
   workflow_dispatch:
@@ -28,53 +28,80 @@ jobs:
       - name: نصب 7z
         run: sudo apt-get update && sudo apt-get install -y p7zip-full
 
-      - name: دانلود فایل از لینک
+      - name: ساخت نام پوشه بر اساس شماره اجرا
+        id: foldername
         run: |
-          curl -L --fail --retry 3 -o downloaded_file "${{ github.event.inputs.file_url }}"
-          ls -lh downloaded_file
+          # استفاده از شماره منحصربه‌فرد اجرا (Run ID) برای جلوگیری از تداخل
+          FOLDER_NAME="download_${{ github.run_id }}"
+          echo "FOLDER_NAME=$FOLDER_NAME" >> $GITHUB_ENV
+          echo "پوشه ساخته خواهد شد: $FOLDER_NAME"
 
-      - name: استخراج نام اصلی فایل (اختیاری)
+      - name: ایجاد پوشه و دانلود فایل (بدون ریسک تزریق فرمان)
+        env:
+          FILE_URL: ${{ github.event.inputs.file_url }}
         run: |
-          ORIGINAL_NAME=$(basename "${{ github.event.inputs.file_url }}" | cut -d '?' -f1)
+          mkdir -p "${{ env.FOLDER_NAME }}"
+          curl -L --fail --retry 3 -o "${{ env.FOLDER_NAME }}/downloaded_file" "$FILE_URL"
+          ls -lh "${{ env.FOLDER_NAME }}/"
+
+      - name: استخراج نام اصلی فایل (اختیاری - فقط برای نمایش)
+        env:
+          FILE_URL: ${{ github.event.inputs.file_url }}
+        run: |
+          ORIGINAL_NAME=$(basename "$FILE_URL" | cut -d '?' -f1)
           [ -z "$ORIGINAL_NAME" ] && ORIGINAL_NAME="downloaded_file"
-          echo "ORIGINAL_NAME=$ORIGINAL_NAME" >> $GITHUB_ENV
+          echo "نام اصلی فایل: $ORIGINAL_NAME (در لاگ‌ها ثبت شد)"
 
-      - name: ساخت آرشیو رمزدار چندتکه (هر تکه ۹۵ مگابایت)
+      - name: ساخت آرشیو رمزدار چندتکه (هر تکه ۹۵ مگابایت) داخل پوشه
+        env:
+          ZIP_PASS: ${{ secrets.ZIP_PASSWORD }}  # رمز باید به عنوان secret تعریف شود
         run: |
-          7z a -p"${{ github.event.inputs.zip_password }}" -mhe=on -mx=3 -v95m "archive.7z" downloaded_file
+          cd "${{ env.FOLDER_NAME }}"
+          # در صورت نبود secret، از ورودی استفاده کن (اخطار می‌دهد ولی رمز در لاگ نمی‌رود)
+          if [ -z "$ZIP_PASS" ]; then
+            echo "⚠️ رمز از input خوانده می‌شود (بهتر است از secret استفاده کنید)"
+            ZIP_PASS="${{ github.event.inputs.zip_password }}"
+          fi
+          7z a -p"$ZIP_PASS" -mhe=on -mx=3 -v95m "archive.7z" downloaded_file
+          cd ..
 
-      - name: حذف فایل اصلی
-        run: rm -f downloaded_file
+      - name: حذف فایل اصلی (برای کاهش حجم در تاریخچه گیت)
+        run: rm -f "${{ env.FOLDER_NAME }}/downloaded_file"
 
       - name: Commit و Push مرحله‌ای تکه‌ها (هر بار ۱۰ تکه)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          # لیست تمام تکه‌ها
+          cd "${{ env.FOLDER_NAME }}"
           chunks=(archive.7z.*)
           total=${#chunks[@]}
-          batch_size=10  # هر بار ۱۰ تکه
+          if [ $total -eq 0 ]; then
+            echo "❌ هیچ تکه‌ای پیدا نشد!"
+            exit 1
+          fi
+          
+          batch_size=10
           start=0
           
           while [ $start -lt $total ]; do
             end=$((start + batch_size - 1))
             [ $end -ge $total ] && end=$((total - 1))
             
-            echo "Pushing chunks $start to $end ..."
+            echo "Pushing chunks $((start+1)) to $((end+1)) of $total from folder ${{ env.FOLDER_NAME }}..."
             
-            # افزودن تکه‌های این بسته
             for i in $(seq $start $end); do
               git add "${chunks[$i]}"
             done
             
-            # commit (با پیام حاوی محدوده)
-            git commit -m "Add chunks $((start+1))-$((end+1)) of $total"
+            git commit -m "Add chunks $((start+1))-$((end+1)) for ${{ env.FOLDER_NAME }}"
             
-            # push با حداکثر تلاش ۵ بار
+            # تلاش برای push با حداکثر ۵ بار و خروج در صورت شکست
+            push_success=false
             for attempt in {1..5}; do
               if git push; then
-                echo "Push successful"
+                push_success=true
+                echo "Push successful (attempt $attempt)"
                 break
               else
                 echo "Push failed (attempt $attempt), retrying in 10 seconds..."
@@ -82,7 +109,13 @@ jobs:
               fi
             done
             
+            if [ "$push_success" = false ]; then
+              echo "❌ پس از ۵ تلاش، push ناموفق بود. خروج از workflow."
+              exit 1
+            fi
+            
             start=$((end + 1))
-            # کمی صبر بین بسته‌ها
             sleep 5
           done
+          
+          cd ..
